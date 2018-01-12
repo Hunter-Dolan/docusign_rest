@@ -1,3 +1,5 @@
+require 'openssl'
+
 module DocusignRest
 
   class Client
@@ -17,19 +19,24 @@ module DocusignRest
 
       # Set up the DocuSign Authentication headers with the values passed from
       # our config block
-      @docusign_authentication_headers = {
-        "X-DocuSign-Authentication" => "" \
-          "<DocuSignCredentials>" \
-            "<Username>#{DocusignRest.username}</Username>" \
-            "<Password>#{DocusignRest.password}</Password>" \
-            "<IntegratorKey>#{DocusignRest.integrator_key}</IntegratorKey>" \
-          "</DocuSignCredentials>"
-      }
+      if access_token.nil?
+        @docusign_authentication_headers = {
+          'X-DocuSign-Authentication' => {
+            'Username' => username,
+            'Password' => password,
+            'IntegratorKey' => integrator_key
+          }.to_json
+        }
+      else
+        @docusign_authentication_headers = {
+          'Authorization' => "Bearer #{access_token}"
+        }
+      end
 
       # Set the account_id from the configure block if present, but can't call
       # the instance var @account_id because that'll override the attr_accessor
       # that is automatically configured for the configure block
-      @acct_id = DocusignRest.account_id
+      @acct_id = account_id
     end
 
 
@@ -38,7 +45,7 @@ module DocusignRest
     # the X-DocuSign-Authentication header to authorize the request.
     #
     # Client can pass in header options to any given request:
-    # headers: {"Some-Key" => "some/value", "Another-Key" => "another/value"}
+    # headers: {'Some-Key' => 'some/value', 'Another-Key' => 'another/value'}
     #
     # Then we pass them on to this method to merge them with the other
     # required headers
@@ -48,11 +55,11 @@ module DocusignRest
     #   headers(options[:headers])
     #
     # Returns a merged hash of headers overriding the default Accept header if
-    # the user passes in a new "Accept" header key and adds any other
+    # the user passes in a new 'Accept' header key and adds any other
     # user-defined headers along with the X-DocuSign-Authentication headers
     def headers(user_defined_headers={})
       default = {
-        "Accept" => "application/json" #this seems to get added automatically, so I can probably remove this
+        'Accept' => 'json' #this seems to get added automatically, so I can probably remove this
       }
 
       default.merge!(user_defined_headers) if user_defined_headers
@@ -68,11 +75,11 @@ module DocusignRest
     #
     # Example:
     #
-    #   build_uri("/login_information")
+    #   build_uri('/login_information')
     #
     # Returns a parsed URI object
     def build_uri(url)
-      URI.parse("#{DocusignRest.endpoint}/#{DocusignRest.api_version}#{url}")
+      URI.parse("#{endpoint}/#{api_version}#{url}")
     end
 
 
@@ -82,13 +89,60 @@ module DocusignRest
     # Returns a configured Net::HTTP object into which a request can be passed
     def initialize_net_http_ssl(uri)
       http = Net::HTTP.new(uri.host, uri.port)
-      http.use_ssl = true
 
-      # Explicitly verifies that the certificate matches the domain. Requires
-      # that we use www when calling the production DocuSign API
-      http.verify_mode = OpenSSL::SSL::VERIFY_PEER
+      http.use_ssl = uri.scheme == 'https'
+
+      if defined?(Rails) && Rails.env.test?
+        in_rails_test_env = true
+      else
+        in_rails_test_env = false
+      end
+
+      if http.use_ssl? && !in_rails_test_env
+        if ca_file
+          if File.exists?(ca_file)
+            http.ca_file = ca_file
+          else
+            raise 'Certificate path not found.'
+          end
+        end
+
+        # Explicitly verifies that the certificate matches the domain.
+        # Requires that we use www when calling the production DocuSign API
+        http.verify_mode = OpenSSL::SSL::VERIFY_PEER
+        http.verify_depth = 5
+      else
+        http.verify_mode = OpenSSL::SSL::VERIFY_NONE
+      end
 
       http
+    end
+
+
+    # Public: creates an OAuth2 authorization server token endpoint.
+    #
+    # email    - email of user authenticating
+    # password - password of user authenticating
+    #
+    # Examples:
+    #
+    #   client = DocusignRest::Client.new
+    #   response = client.get_token('someone@example.com', 'p@ssw0rd01')
+    #
+    # Returns:
+    #   access_token - Access token information
+    #   scope - This should always be "api"
+    #   token_type - This should always be "bearer"
+    def get_token(account_id, email, password)
+      content_type = { 'Content-Type' => 'application/x-www-form-urlencoded', 'Accept' => 'application/json' }
+      uri = build_uri('/oauth2/token')
+
+      request = Net::HTTP::Post.new(uri.request_uri, content_type)
+      request.body = "grant_type=password&client_id=#{integrator_key}&username=#{email}&password=#{password}&scope=api"
+
+      http = initialize_net_http_ssl(uri)
+      response = http.request(request)
+      JSON.parse(response.body)
     end
 
 
@@ -111,7 +165,7 @@ module DocusignRest
     #   userId    - # TODO determine what this is used for, if anything
     #   userName  - Full name provided when signing up for DocuSign
     def get_login_information(options={})
-      uri = build_uri("/login_information")
+      uri = build_uri('/login_information')
       request = Net::HTTP::Get.new(uri.request_uri, headers(options[:headers]))
       http = initialize_net_http_ssl(uri)
       http.request(request)
@@ -130,21 +184,14 @@ module DocusignRest
     #
     # Returns the accountId string
     def get_account_id
-      unless @acct_id
+      unless acct_id
         response = get_login_information.body
         hashed_response = JSON.parse(response)
         login_accounts = hashed_response['loginAccounts']
-        @acct_id ||= login_accounts.first['accountId']
+        acct_id ||= login_accounts.first['accountId']
       end
 
-      @acct_id
-    end
-
-
-    def check_embedded_signer(embedded, email)
-      if embedded && embedded == true
-        "\"clientUserId\" : \"#{email}\","
-      end
+      acct_id
     end
 
 
@@ -158,20 +205,69 @@ module DocusignRest
     # name      - The name of the signer
     # email     - The email of the signer
     # role_name - The role name of the signer ('Attorney', 'Client', etc.).
+    # tabs      - Array of tab pairs grouped by type (Example type: 'textTabs')
+    #             { textTabs: [ { tabLabel: "label", name: "name", value: "value" } ] }
+    #
+    #             NOTE: The 'tabs' option is NOT supported in 'v1' of the REST API
     #
     # Returns a hash of users that need to be embedded in the template to
     # create an envelope
     def get_template_roles(signers)
       template_roles = []
       signers.each_with_index do |signer, index|
-        template_roles << "{
-          #{check_embedded_signer(signer[:embedded], signer[:email])}
-          \"name\"         : \"#{signer[:name]}\",
-          \"email\"        : \"#{signer[:email]}\",
-          \"roleName\"     : \"#{signer[:role_name]}\"
-        }"
+        template_role = {
+          name:     signer[:name],
+          email:    signer[:email],
+          roleName: signer[:role_name],
+          tabs: {
+            textTabs:     get_signer_tabs(signer[:text_tabs]),
+            checkboxTabs: get_signer_tabs(signer[:checkbox_tabs]),
+            numberTabs:   get_signer_tabs(signer[:number_tabs]),
+            fullNameTabs: get_signer_tabs(signer[:fullname_tabs]),
+            dateTabs:     get_signer_tabs(signer[:date_tabs])
+          }
+        }
+
+        if signer[:email_notification]
+          template_role[:emailNotification] = signer[:email_notification]
+        end
+
+        template_role['clientUserId'] = (signer[:client_id] || signer[:email]).to_s if signer[:embedded] == true
+        template_roles << template_role
       end
-      template_roles.join(",")
+      template_roles
+    end
+
+
+    # TODO (2014-02-03) jonk => document
+    def get_signer_tabs(tabs)
+      Array(tabs).map do |tab|
+        {
+          'tabLabel' => tab[:label],
+          'name' => tab[:name],
+          'value' => tab[:value],
+          'documentId' => tab[:document_id],
+          'selected' => tab[:selected]
+        }
+      end
+    end
+
+
+    # TODO (2014-02-03) jonk => document
+    def get_event_notification(event_notification)
+      return {} unless event_notification
+      {
+        useSoapInterface:          event_notification[:use_soap_interface] || false,
+        includeCertificatWithSoap: event_notification[:include_certificate_with_soap] || false,
+        url:                       event_notification[:url],
+        loggingEnabled:            event_notification[:logging],
+        'EnvelopeEvents' => Array(event_notification[:envelope_events]).map do |envelope_event|
+          {
+            includeDocuments:        envelope_event[:include_documents] || false,
+            envelopeEventStatusCode: envelope_event[:envelope_event_status_code]
+          }
+        end
+      }
     end
 
 
@@ -207,101 +303,153 @@ module DocusignRest
     # tab_label          - TODO: figure out what this is
     def get_signers(signers, options={})
       doc_signers = []
-      signers.each_with_index do |signer, index|
-        # Build up a string with concatenation so that we can append the full
-        # string to the doc_signers array as the last step in this block
-        doc_signer = ""
-        doc_signer << "{
-          \"email\":\"#{signer[:email]}\",
-          \"name\":\"#{signer[:name]}\",
-          \"accessCode\":\"\",
-          \"addAccessCodeToEmail\":false,
-          #{check_embedded_signer(signer[:embedded], signer[:email])}
-          \"customFields\":null,
-          \"emailNotification\":#{signer[:email_notification] || 'null'},
-          \"iDCheckConfigurationName\":null,
-          \"iDCheckInformationInput\":null,
-          \"inheritEmailNotificationConfiguration\":false,
-          \"note\":\"\",
-          \"phoneAuthentication\":null,
-          \"recipientAttachment\":null,
-          \"recipientId\":\"#{index+1}\",
-          \"requireIdLookup\":false,
-          \"roleName\":\"#{signer[:role_name]}\",
-          \"routingOrder\":#{index+1},
-          \"socialAuthentications\":null,
-        "
 
-        if options[:template] == true
-          doc_signer << "
-            \"templateAccessCodeRequired\":false,
-            \"templateLocked\":#{signer[:template_locked] || true},
-            \"templateRequired\":#{signer[:template_required] || true},
-          "
+      signers.each_with_index do |signer, index|
+        doc_signer = {
+          email:                                 signer[:email],
+          name:                                  signer[:name],
+          accessCode:                            '',
+          addAccessCodeToEmail:                  false,
+          customFields:                          nil,
+          iDCheckConfigurationName:              nil,
+          iDCheckInformationInput:               nil,
+          inheritEmailNotificationConfiguration: false,
+          note:                                  '',
+          phoneAuthentication:                   nil,
+          recipientAttachment:                   nil,
+          recipientId:                           "#{index + 1}",
+          requireIdLookup:                       false,
+          roleName:                              signer[:role_name],
+          routingOrder:                          index + 1,
+          socialAuthentications:                 nil
+        }
+
+        if signer[:email_notification]
+          doc_signer[:emailNotification] = signer[:email_notification]
         end
 
-        doc_signer << "
-          \"autoNavigation\":false,
-          \"defaultRecipient\":false,
-          \"signatureInfo\":null,
-          \"tabs\":{
-            \"approveTabs\":null,
-            \"checkboxTabs\":null,
-            \"companyTabs\":null,
-            \"dateSignedTabs\":null,
-            \"dateTabs\":null,
-            \"declineTabs\":null,
-            \"emailTabs\":null,
-            \"envelopeIdTabs\":null,
-            \"fullNameTabs\":null,
-            \"initialHereTabs\":null,
-            \"listTabs\":null,
-            \"noteTabs\":null,
-            \"numberTabs\":null,
-            \"radioGroupTabs\":null,
-            \"signHereTabs\":[
-          "
-          signer[:sign_here_tabs].each do |sign_here_tab|
-            doc_signer << "{
-              \"anchorString\":\"#{sign_here_tab[:anchor_string]}\",
-              \"anchorXOffset\": \"#{sign_here_tab[:anchor_x_offset] || '0'}\",
-              \"anchorYOffset\": \"#{sign_here_tab[:anchor_y_offset] || '0'}\",
-              \"anchorIgnoreIfNotPresent\": #{sign_here_tab[:ignore_anchor_if_not_present] || false},
-              \"anchorUnits\": \"pixels\",
-              \"conditionalParentLabel\": null,
-              \"conditionalParentValue\": null,
-              \"documentId\":\"#{sign_here_tab[:document_id] || '1'}\",
-              \"pageNumber\":\"#{sign_here_tab[:page_number] || '1'}\",
-              \"recipientId\":\"#{index+1}\",
-            "
-            if options[:template] == true
-              doc_signer << "
-                \"templateLocked\":#{sign_here_tab[:template_locked] || true},
-                \"templateRequired\":#{sign_here_tab[:template_required] || true},
-              "
-            end
-            doc_signer << "
-              \"xPosition\":\"#{sign_here_tab[:x_position] || '0'}\",
-              \"yPosition\":\"#{sign_here_tab[:y_position] || '0'}\",
-              \"name\":\"#{sign_here_tab[:sign_here_tab_text] || 'Sign Here'}\",
-              \"optional\":false,
-              \"scaleValue\":1,
-              \"tabLabel\":\"#{sign_here_tab[:tab_label] || 'Signature 1'}\"
-            },"
-          end
-          doc_signer << "],
-            \"signerAttachmentTabs\":null,
-            \"ssnTabs\":null,
-            \"textTabs\":null,
-            \"titleTabs\":null,
-            \"zipTabs\":null
-          }
-        }"
+        if signer[:embedded]
+          doc_signer[:clientUserId] = signer[:client_id] || signer[:email]
+        end
+
+        if signer[:embedded_recipient_start_url]
+          doc_signer[:embeddedRecipientStartURL] = signer[:embedded_recipient_start_url]
+        end
+
+        if options[:template] == true
+          doc_signer[:templateAccessCodeRequired] = false
+          doc_signer[:templateLocked]             = signer[:template_locked].nil? ? true : signer[:template_locked]
+          doc_signer[:templateRequired]           = signer[:template_required].nil? ? true : signer[:template_required]
+        end
+
+        doc_signer[:autoNavigation]   = false
+        doc_signer[:defaultRecipient] = false
+        doc_signer[:signatureInfo]    = nil
+        doc_signer[:tabs]             = {
+          approveTabs:          nil,
+          checkboxTabs:         get_tabs(signer[:checkbox_tabs], options, index),
+          companyTabs:          nil,
+          dateSignedTabs:       get_tabs(signer[:date_signed_tabs], options, index),
+          dateTabs:             nil,
+          declineTabs:          nil,
+          emailTabs:            get_tabs(signer[:email_tabs], options, index),
+          envelopeIdTabs:       nil,
+          fullNameTabs:         get_tabs(signer[:full_name_tabs], options, index),
+          listTabs:             get_tabs(signer[:list_tabs], options, index),
+          noteTabs:             nil,
+          numberTabs:           nil,
+          radioGroupTabs:       get_radio_group_tabs(signer[:radio_tabs], options, index),
+          initialHereTabs:      get_tabs(signer[:initial_here_tabs], options.merge!(initial_here_tab: true), index),
+          signHereTabs:         get_tabs(signer[:sign_here_tabs], options.merge!(sign_here_tab: true), index),
+          signerAttachmentTabs: nil,
+          ssnTabs:              nil,
+          textTabs:             get_tabs(signer[:text_tabs], options, index),
+          titleTabs:            get_tabs(signer[:title_tabs], options, index),
+          zipTabs:              nil
+        }
+
         # append the fully build string to the array
         doc_signers << doc_signer
       end
-      doc_signers.join(",")
+      doc_signers
     end
+
+
+    # TODO (2014-02-03) jonk => document
+    def get_tabs(tabs, options, index)
+      tab_array = []
+
+      Array(tabs).map do |tab|
+        tab_hash = {}
+
+        if tab[:anchor_string]
+          tab_hash[:anchorString]             = tab[:anchor_string]
+          tab_hash[:anchorXOffset]            = tab[:anchor_x_offset] || '0'
+          tab_hash[:anchorYOffset]            = tab[:anchor_y_offset] || '0'
+          tab_hash[:anchorIgnoreIfNotPresent] = tab[:ignore_anchor_if_not_present] || false
+          tab_hash[:anchorUnits]              = 'pixels'
+        end
+
+        tab_hash[:conditionalParentLabel]   = nil
+        tab_hash[:conditionalParentValue]   = nil
+        tab_hash[:documentId]               = tab[:document_id] || '1'
+        tab_hash[:pageNumber]               = tab[:page_number] || '1'
+        tab_hash[:recipientId]              = index + 1
+        tab_hash[:required]                 = tab[:required] || false
+
+        if options[:template] == true
+          tab_hash[:templateLocked]   = tab[:template_locked].nil? ? true : tab[:template_locked]
+          tab_hash[:templateRequired] = tab[:template_required].nil? ? true : tab[:template_required]
+        end
+
+        if options[:sign_here_tab] == true || options[:initial_here_tab] == true
+          tab_hash[:scaleValue] = tab_hash[:scaleValue] || 1
+        end
+
+        tab_hash[:xPosition]  = tab[:x_position] || '0'
+        tab_hash[:yPosition]  = tab[:y_position] || '0'
+        tab_hash[:name]       = tab[:name] if tab[:name]
+        tab_hash[:optional]   = false
+        tab_hash[:tabLabel]   = tab[:label] || tab[:tab_label] || 'Signature 1'
+        tab_hash[:width]      = tab[:width] if tab[:width]
+        tab_hash[:height]     = tab[:height] if tab[:width]
+        tab_hash[:value]      = tab[:value] if tab[:value]
+
+        tab_hash[:locked]     = tab[:locked] || false
+
+        tab_hash[:list_items] = tab[:list_items] if tab[:list_items]
+
+        tab_hash[:groupName] = tab[:group_name] if tab.key?(:group_name)
+        tab_hash[:radios] = get_tabs(tab[:radios], options, index) if tab.key?(:radios)
+
+        tab_hash[:selected] = tab[:selected] if tab[:selected]
+
+        tab_hash[:font] = tab[:font] if tab[:font]
+        tab_hash[:fontSize] = tab[:font_size] if tab[:font_size]
+        tab_hash[:fontColor] = tab[:font_color] if tab[:font_color]
+        tab_hash[:bold] = tab[:bold] if tab[:bold]
+        tab_hash[:italic] = tab[:italic] if tab[:italic]
+
+        tab_array << tab_hash
+      end
+      tab_array
+    end
+    
+    def get_radio_group_tabs(tabs, options, index)
+      return [] if tabs.blank?
+      group_names = tabs.map { |t| t[:tab_label] }.uniq
+      group_names.map do |group_name|
+        first_tab_for_label = tabs.detect { |t| t[:tab_label].to_s == group_name.to_s }
+        {
+          groupName: group_name,
+          documentId: first_tab_for_label[:document_id] || '1',
+          pageNumber: first_tab_for_label[:page_number] || '1',
+          recipientId: index + 1,
+          radios: get_tabs(tabs, options, index)
+        }
+      end
+    end
+
 
     # Internal: sets up the file ios array
     #
@@ -326,8 +474,8 @@ module DocusignRest
       #
       # Usage:
       #
-      #     UploadIO.new("file.txt", "text/plain")
-      #     UploadIO.new(file_io, "text/plain", "file.txt")
+      #     UploadIO.new('file.txt', 'text/plain')
+      #     UploadIO.new(file_io, 'text/plain', 'file.txt')
       # ********************************************************************
       #
       # There is also a 4th undocumented argument, opts={}, which allows us
@@ -338,9 +486,9 @@ module DocusignRest
       files.each_with_index do |file, index|
         ios << UploadIO.new(
                  file[:io] || file[:path],
-                 file[:content_type] || "application/pdf",
+                 file[:content_type] || 'application/pdf',
                  file[:name],
-                 "Content-Disposition" => "file; documentid=#{index+1}"
+                 'Content-Disposition' => "file; documentid=#{index + 1}"
                )
       end
       ios
@@ -357,25 +505,62 @@ module DocusignRest
       # multi-doc uploading capabilities, each doc needs to be it's own param
       file_params = {}
       ios.each_with_index do |io,index|
-        file_params.merge!("file#{index+1}" => io)
+        file_params.merge!("file#{index + 1}" => io)
       end
       file_params
     end
 
 
     # Internal: takes in an array of hashes of documents and calculates the
-    # documentId then concatenates all the hashes with commas
+    # documentId
     #
     # Returns a hash of documents that are to be uploaded
     def get_documents(ios)
-      documents = []
-      ios.each_with_index do |io, index|
-        documents << "{
-          \"documentId\" : \"#{index+1}\",
-          \"name\"       : \"#{io.original_filename}\"
-        }"
+      ios.each_with_index.map do |io, index|
+        {
+          documentId: "#{index + 1}",
+          name: io.original_filename
+        }
       end
-      documents.join(",")
+    end
+
+
+    # Internal: takes in an array of server template ids and an array of the signers
+    # and sets up the composite template
+    #
+    # Returns an array of server template hashes
+    def get_composite_template(server_template_ids, signers)
+      composite_array = []
+      index = 1
+      server_template_ids.each  do |template_id|
+        server_template_hash = Hash[:sequence, index, \
+          :templateId, template_id]
+        templates_hash = Hash[:serverTemplates, [server_template_hash], \
+          :inlineTemplates,  get_inline_signers(signers, index)]
+        composite_array << templates_hash
+        index += 1
+      end
+      composite_array
+    end
+
+
+    # Internal: takes signer info and the inline template sequence number
+    # and sets up the inline template
+    #
+    # Returns an array of signers
+    def get_inline_signers(signers, sequence)
+      filtered_signers = signers
+      filtered_signers.each do |signer|
+        signer.each do |key, tabs|
+          if key.to_s.end_with?('tabs')
+            filtered_tabs = tabs.select { |tab| tab[:sequence].to_s == sequence.to_s }
+            signer[key] = filtered_tabs
+          end
+        end
+      end
+      signers_array = get_signers(filtered_signers)
+      template_hash = Hash[:sequence, sequence, :recipients, { signers: signers_array }]
+      [template_hash]
     end
 
 
@@ -398,12 +583,12 @@ module DocusignRest
       #
       request = Net::HTTP::Post::Multipart.new(
         uri.request_uri,
-        {post_body: post_body}.merge(file_params),
+        { post_body: post_body }.merge(file_params),
         headers
       )
 
       # DocuSign requires that we embed the document data in the body of the
-      # JSON request directly so we need to call ".read" on the multipart-post
+      # JSON request directly so we need to call '.read' on the multipart-post
       # provided body_stream in order to serialize all the files into a
       # compatible JSON string.
       request.body = request.body_stream.read
@@ -442,18 +627,17 @@ module DocusignRest
       ios = create_file_ios(options[:files])
       file_params = create_file_params(ios)
 
-      post_body = "{
-        \"emailBlurb\"   : \"#{options[:email][:body] if options[:email]}\",
-        \"emailSubject\" : \"#{options[:email][:subject] if options[:email]}\",
-        \"documents\"    : [#{get_documents(ios)}],
-        \"recipients\"   : {
-          \"signers\" : [#{get_signers(options[:signers])}]
+      post_body = {
+        emailBlurb:   "#{options[:email][:body] if options[:email]}",
+        emailSubject: "#{options[:email][:subject] if options[:email]}",
+        documents: get_documents(ios),
+        recipients: {
+          signers: get_signers(options[:signers])
         },
-        \"status\"       : \"#{options[:status]}\"
-      }
-      "
+        status: "#{options[:status]}"
+      }.to_json
 
-      uri = build_uri("/accounts/#{@acct_id}/envelopes")
+      uri = build_uri("/accounts/#{acct_id}/envelopes")
 
       http = initialize_net_http_ssl(uri)
 
@@ -461,9 +645,8 @@ module DocusignRest
                   uri, post_body, file_params, headers(options[:headers])
                 )
 
-      # Finally do the Net::HTTP request!
       response = http.request(request)
-      parsed_response = JSON.parse(response.body)
+      JSON.parse(response.body)
     end
 
 
@@ -499,36 +682,47 @@ module DocusignRest
       ios = create_file_ios(options[:files])
       file_params = create_file_params(ios)
 
-      post_body = "{
-        \"emailBlurb\"   : \"#{options[:email][:body] if options[:email]}\",
-        \"emailSubject\" : \"#{options[:email][:subject] if options[:email]}\",
-        \"documents\"    : [#{get_documents(ios)}],
-        \"recipients\"   : {
-          \"signers\"    : [#{get_signers(options[:signers], template: true)}]
+      post_body = {
+        emailBlurb: "#{options[:email][:body] if options[:email]}",
+        emailSubject: "#{options[:email][:subject] if options[:email]}",
+        documents: get_documents(ios),
+        recipients: {
+          signers: get_signers(options[:signers], template: true)
         },
-        \"envelopeTemplateDefinition\" : {
-          \"description\" : \"#{options[:description]}\",
-          \"name\"        : \"#{options[:name]}\",
-          \"pageCount\"   : 1,
-          \"password\"    : \"\",
-          \"shared\"      : false
+        envelopeTemplateDefinition: {
+          description: options[:description],
+          name: options[:name],
+          folderName: options[:folder_name],
+          pageCount: 1,
+          password: '',
+          shared: false
         }
-      }
-      "
+      }.to_json
 
-      uri = build_uri("/accounts/#{@acct_id}/templates")
-
+      uri = build_uri("/accounts/#{acct_id}/templates")
       http = initialize_net_http_ssl(uri)
 
       request = initialize_net_http_multipart_post_request(
                   uri, post_body, file_params, headers(options[:headers])
                 )
 
-      # Finally do the Net::HTTP request!
       response = http.request(request)
-      parsed_response = JSON.parse(response.body)
+      JSON.parse(response.body)
     end
 
+
+    # TODO (2014-02-03) jonk => document
+    def get_template(template_id, options = {})
+      content_type = { 'Content-Type' => 'application/json' }
+      content_type.merge(options[:headers]) if options[:headers]
+
+      uri = build_uri("/accounts/#{acct_id}/templates/#{template_id}")
+
+      http = initialize_net_http_ssl(uri)
+      request = Net::HTTP::Get.new(uri.request_uri, headers(content_type))
+      response = http.request(request)
+      JSON.parse(response.body)
+    end
 
     # Public: create an envelope for delivery from a template
     #
@@ -553,18 +747,19 @@ module DocusignRest
     #   templateId - The auto-generated ID provided by DocuSign
     #   Uri - the URI where the template is located on the DocuSign servers
     def create_envelope_from_template(options={})
-      content_type = {'Content-Type' => 'application/json'}
+      content_type = { 'Content-Type' => 'application/json' }
       content_type.merge(options[:headers]) if options[:headers]
 
-      post_body = "{
-        \"status\"        : \"#{options[:status]}\",
-        \"emailBlurb\"    : \"#{options[:email][:body]}\",
-        \"emailSubject\"  : \"#{options[:email][:subject]}\",
-        \"templateId\"    : \"#{options[:template_id]}\",
-        \"templateRoles\" : [#{get_template_roles(options[:signers])}],
-       }"
+      post_body = {
+        status:             options[:status],
+        emailBlurb:         options[:email][:body],
+        emailSubject:       options[:email][:subject],
+        templateId:         options[:template_id],
+        eventNotification:  get_event_notification(options[:event_notification]),
+        templateRoles:      get_template_roles(options[:signers])
+       }.to_json
 
-      uri = build_uri("/accounts/#{@acct_id}/envelopes")
+      uri = build_uri("/accounts/#{acct_id}/envelopes")
 
       http = initialize_net_http_ssl(uri)
 
@@ -572,7 +767,75 @@ module DocusignRest
       request.body = post_body
 
       response = http.request(request)
-      parsed_response = JSON.parse(response.body)
+      JSON.parse(response.body)
+    end
+
+
+    # Public: create an envelope for delivery from a composite template
+    #
+    # headers               - Optional hash of headers to merge into the existing
+    #                         required headers for a POST request.
+    # status                - Options include: 'sent', or 'created' and
+    #                         determine if the envelope is sent out immediately or
+    #                         stored for sending at a later time
+    # email/body            - Sets the text in the email body
+    # email/subject         - Sets the text in the email subject line
+    # template_roles        - See the get_template_roles method definition for a list
+    #                         of options to pass. Note: for consistency sake we call
+    #                         this 'signers' and not 'templateRoles' when we build up
+    #                         the request in client code.
+    # headers               - Optional hash of headers to merge into the existing
+    #                         required headers for a multipart request.
+    # server_template_ids   - Array of ids for templates uploaded to DocuSign. Templates
+    #                         will be added in the order they appear in the array.
+    #
+    # Returns a JSON parsed response body containing the envelope's:
+    #   envelopeId - autogenerated ID provided by Docusign
+    #   uri - the URI where the template is located on the DocuSign servers
+    #   statusDateTime - The date/time the envelope was created
+    #   status         - Sent, created, or voided
+    def create_envelope_from_composite_template(options={})
+      content_type = { 'Content-Type' => 'application/json' }
+      content_type.merge(options[:headers]) if options[:headers]
+
+      post_body = {
+        emailBlurb:         options[:email][:body],
+        emailSubject:       options[:email][:subject],
+        status:             options[:status],
+        compositeTemplates: get_composite_template(options[:server_template_ids], options[:signers])
+      }.to_json
+
+      uri = build_uri("/accounts/#{acct_id}/envelopes")
+
+      http = initialize_net_http_ssl(uri)
+
+      request = Net::HTTP::Post.new(uri.request_uri, headers(content_type))
+      request.body = post_body
+
+      response = http.request(request)
+      JSON.parse(response.body)
+    end
+
+
+    # Public returns the names specified for a given email address (existing docusign user)
+    #
+    # email       - the email of the recipient
+    # headers     - optional hash of headers to merge into the existing
+    #               required headers for a multipart request.
+    #
+    # Returns the list of names
+    def get_recipient_names(options={})
+      content_type = { 'Content-Type' => 'application/json' }
+      content_type.merge(options[:headers]) if options[:headers]
+
+      uri = build_uri("/accounts/#{acct_id}/recipient_names?email=#{options[:email]}")
+
+      http = initialize_net_http_ssl(uri)
+
+      request = Net::HTTP::Post.new(uri.request_uri, headers(content_type))
+
+      response = http.request(request)
+      JSON.parse(response.body)
     end
 
 
@@ -588,18 +851,18 @@ module DocusignRest
     #
     # Returns the URL string for embedded signing (can be put in an iFrame)
     def get_recipient_view(options={})
-      content_type = {'Content-Type' => 'application/json'}
+      content_type = { 'Content-Type' => 'application/json' }
       content_type.merge(options[:headers]) if options[:headers]
 
-      post_body = "{
-        \"authenticationMethod\" : \"email\",
-        \"clientUserId\"         : \"#{options[:email]}\",
-        \"email\"                : \"#{options[:email]}\",
-        \"returnUrl\"            : \"#{options[:return_url]}\",
-        \"userName\"             : \"#{options[:name]}\",
-       }"
+      post_body = {
+        authenticationMethod: 'email',
+        clientUserId:         options[:client_id] || options[:email],
+        email:                options[:email],
+        returnUrl:            options[:return_url],
+        userName:             options[:name]
+      }.to_json
 
-      uri = build_uri("/accounts/#{@acct_id}/envelopes/#{options[:envelope_id]}/views/recipient")
+      uri = build_uri("/accounts/#{acct_id}/envelopes/#{options[:envelope_id]}/views/recipient")
 
       http = initialize_net_http_ssl(uri)
 
@@ -607,15 +870,44 @@ module DocusignRest
       request.body = post_body
 
       response = http.request(request)
-      parsed_response = JSON.parse(response.body)
-      parsed_response["url"]
+      JSON.parse(response.body)
     end
+
+
+    # Public returns the URL for embedded console
+    #
+    # envelope_id - the ID of the envelope you wish to use for embedded signing
+    # headers     - optional hash of headers to merge into the existing
+    #               required headers for a multipart request.
+    #
+    # Returns the URL string for embedded console (can be put in an iFrame)
+    def get_console_view(options={})
+      content_type = { 'Content-Type' => 'application/json' }
+      content_type.merge(options[:headers]) if options[:headers]
+
+      post_body = {
+        envelopeId: options[:envelope_id]
+      }.to_json
+
+      uri = build_uri("/accounts/#{acct_id}/views/console")
+
+      http = initialize_net_http_ssl(uri)
+
+      request = Net::HTTP::Post.new(uri.request_uri, headers(content_type))
+      request.body = post_body
+
+      response = http.request(request)
+
+      parsed_response = JSON.parse(response.body)
+      parsed_response['url']
+    end
+
 
     # Public returns the envelope recipients for a given envelope
     #
     # include_tabs - boolean, determines if the tabs for each signer will be
     #                returned in the response, defaults to false.
-    # envelope_id  - ID of the envelope for which you want to retrive the
+    # envelope_id  - ID of the envelope for which you want to retrieve the
     #                signer info
     # headers      - optional hash of headers to merge into the existing
     #                required headers for a multipart request.
@@ -623,18 +915,63 @@ module DocusignRest
     # Returns a hash of detailed info about the envelope including the signer
     # hash and status of each signer
     def get_envelope_recipients(options={})
-      content_type = {'Content-Type' => 'application/json'}
+      content_type = { 'Content-Type' => 'application/json' }
       content_type.merge(options[:headers]) if options[:headers]
 
       include_tabs = options[:include_tabs] || false
       include_extended = options[:include_extended] || false
-      uri = build_uri("/accounts/#{@acct_id}/envelopes/#{options[:envelope_id]}/recipients?include_tabs=#{include_tabs}&include_extended=#{include_extended}")
+      uri = build_uri("/accounts/#{acct_id}/envelopes/#{options[:envelope_id]}/recipients?include_tabs=#{include_tabs}&include_extended=#{include_extended}")
 
       http = initialize_net_http_ssl(uri)
       request = Net::HTTP::Get.new(uri.request_uri, headers(content_type))
       response = http.request(request)
-      parsed_response = JSON.parse(response.body)
+      JSON.parse(response.body)
     end
+
+
+    # Public retrieves the envelope status
+    #
+    # envelope_id      - ID of the envelope from which the doc will be retrieved
+    def get_envelope_status(options={})
+      content_type = { 'Content-Type' => 'application/json' }
+      content_type.merge(options[:headers]) if options[:headers]
+
+      uri = build_uri("/accounts/#{acct_id}/envelopes/#{options[:envelope_id]}")
+
+      http = initialize_net_http_ssl(uri)
+      request = Net::HTTP::Get.new(uri.request_uri, headers(content_type))
+      response = http.request(request)
+      JSON.parse(response.body)
+    end
+
+
+    # Public retrieves the statuses of envelopes matching the given query
+    #
+    # from_date      - Docusign formatted Date/DateTime. Only return items after this date.
+    #
+    # to_date        - Docusign formatted Date/DateTime. Only return items up to this date.
+    #                  Defaults to the time of the call.
+    #
+    # from_to_status - The status of the envelope checked for in the from_date - to_date period.
+    #                  Defaults to 'changed'
+    #
+    # status         - The current status of the envelope. Defaults to any status.
+    #
+    # Returns an array of hashes containing envelope statuses, ids, and similar information.
+    def get_envelope_statuses(options={})
+      content_type = { 'Content-Type' => 'application/json' }
+      content_type.merge(options[:headers]) if options[:headers]
+
+      query_params = options.slice(:from_date, :to_date, :from_to_status, :status)
+      uri = build_uri("/accounts/#{acct_id}/envelopes?#{query_params.to_query}")
+
+      http     = initialize_net_http_ssl(uri)
+      request  = Net::HTTP::Get.new(uri.request_uri, headers(content_type))
+      response = http.request(request)
+
+      JSON.parse(response.body)
+    end
+
 
     # Public retrieves the attached file from a given envelope
     #
@@ -648,21 +985,23 @@ module DocusignRest
     # Example
     #
     #   client.get_document_from_envelope(
-    #     envelope_id: @envelope_response["envelopeId"],
+    #     envelope_id: @envelope_response['envelopeId'],
     #     document_id: 1,
-    #     local_save_path: 'docusign_docs/file_name.pdf'
+    #     local_save_path: 'docusign_docs/file_name.pdf',
+    #     return_stream: true/false # will return the bytestream instead of saving doc to file system.
     #   )
     #
     # Returns the PDF document as a byte stream.
     def get_document_from_envelope(options={})
-      content_type = {'Content-Type' => 'application/json'}
+      content_type = { 'Content-Type' => 'application/json' }
       content_type.merge(options[:headers]) if options[:headers]
 
-      uri = build_uri("/accounts/#{@acct_id}/envelopes/#{options[:envelope_id]}/documents/#{options[:document_id]}")
+      uri = build_uri("/accounts/#{acct_id}/envelopes/#{options[:envelope_id]}/documents/#{options[:document_id]}?watermark=true&&show_changes=true")
 
       http = initialize_net_http_ssl(uri)
       request = Net::HTTP::Get.new(uri.request_uri, headers(content_type))
       response = http.request(request)
+      return response.body if options[:return_stream]
 
       split_path = options[:local_save_path].split('/')
       split_path.pop #removes the document name and extension from the array
@@ -673,6 +1012,312 @@ module DocusignRest
         output << response.body
       end
     end
-  end
 
+
+    # Public retrieves the document infos from a given envelope
+    #
+    # envelope_id - ID of the envelope from which document infos are to be retrieved
+    #
+    # Returns a hash containing the envelopeId and the envelopeDocuments array
+    def get_documents_from_envelope(options={})
+      content_type = { 'Content-Type' => 'application/json' }
+      content_type.merge(options[:headers]) if options[:headers]
+
+      uri = build_uri("/accounts/#{acct_id}/envelopes/#{options[:envelope_id]}/documents")
+
+      http     = initialize_net_http_ssl(uri)
+      request  = Net::HTTP::Get.new(uri.request_uri, headers(content_type))
+      response = http.request(request)
+
+      JSON.parse(response.body)
+    end
+
+
+    # Public retrieves a PDF containing the combined content of all
+    # documents and the certificate for the given envelope.
+    #
+    # envelope_id      - ID of the envelope from which the doc will be retrieved
+    # local_save_path  - Local absolute path to save the doc to including the
+    #                    filename itself
+    # headers          - Optional hash of headers to merge into the existing
+    #                    required headers for a multipart request.
+    #
+    # Example
+    #
+    #   client.get_combined_document_from_envelope(
+    #     envelope_id: @envelope_response['envelopeId'],
+    #     local_save_path: 'docusign_docs/file_name.pdf',
+    #     return_stream: true/false # will return the bytestream instead of saving doc to file system.
+    #   )
+    #
+    # Returns the PDF document as a byte stream.
+    def get_combined_document_from_envelope(options={})
+      content_type = { 'Content-Type' => 'application/json' }
+      content_type.merge(options[:headers]) if options[:headers]
+
+      uri = build_uri("/accounts/#{acct_id}/envelopes/#{options[:envelope_id]}/documents/combined?watermark=true&&show_changes=true")
+
+      http = initialize_net_http_ssl(uri)
+      request = Net::HTTP::Get.new(uri.request_uri, headers(content_type))
+      response = http.request(request)
+      return response.body if options[:return_stream]
+
+      split_path = options[:local_save_path].split('/')
+      split_path.pop #removes the document name and extension from the array
+      path = split_path.join("/") #rejoins the array to form path to the folder that will contain the file
+
+      FileUtils.mkdir_p(path)
+      File.open(options[:local_save_path], 'wb') do |output|
+        output << response.body
+      end
+    end
+
+
+    # Public moves the specified envelopes to the given folder
+    #
+    # envelope_ids     - IDs of the envelopes to be moved
+    # folder_id        - ID of the folder to move the envelopes to
+    # headers          - Optional hash of headers to merge into the existing
+    #                    required headers for a multipart request.
+    #
+    # Example
+    #
+    #   client.move_envelope_to_folder(
+    #     envelope_ids: ["xxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxx"]
+    #     folder_id: "xxxxx-2222xxxxx",
+    #   )
+    #
+    # Returns the response.
+    def move_envelope_to_folder(options = {})
+      content_type = { 'Content-Type' => 'application/json' }
+      content_type.merge(options[:headers]) if options[:headers]
+
+      post_body = {
+        envelopeIds: options[:envelope_ids]
+      }.to_json
+
+      uri = build_uri("/accounts/#{acct_id}/folders/#{options[:folder_id]}")
+
+      http = initialize_net_http_ssl(uri)
+      request = Net::HTTP::Put.new(uri.request_uri, headers(content_type))
+      request.body = post_body
+      response = http.request(request)
+
+      response
+    end
+
+
+    # Public returns a hash of audit events for a given envelope
+    #
+    # envelope_id       - ID of the envelope to get audit events from
+    #
+    #
+    # Example
+    # client.get_envelope_audit_events(
+    #   envelope_id: "xxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxx"
+    # )
+    # Returns a hash of the events that have happened to the envelope.
+    def get_envelope_audit_events(options = {})
+      content_type = { 'Content-Type' => 'application/json' }
+      content_type.merge(options[:headers]) if options[:headers]
+
+      uri = build_uri("/accounts/#{acct_id}/envelopes/#{options[:envelope_id]}/audit_events")
+
+      http = initialize_net_http_ssl(uri)
+      request = Net::HTTP::Get.new(uri.request_uri, headers(content_type))
+      response = http.request(request)
+
+      JSON.parse(response.body)
+    end
+
+
+    # Public retrieves the envelope(s) from a specific folder based on search params.
+    #
+    # Option Query Terms(none are required):
+    # query_params:
+    #   start_position: Integer The position of the folder items to return. This is used for repeated calls, when the number of envelopes returned is too much for one return (calls return 100 envelopes at a time). The default value is 0.
+    #   from_date:      date/Time Only return items on or after this date. If no value is provided, the default search is the previous 30 days.
+    #   to_date:        date/Time Only return items up to this date. If no value is provided, the default search is to the current date.
+    #   search_text:    String   The search text used to search the items of the envelope. The search looks at recipient names and emails, envelope custom fields, sender name, and subject.
+    #   status:         Status  The current status of the envelope. If no value is provided, the default search is all/any status.
+    #   owner_name:     username  The name of the folder owner.
+    #   owner_email:    email The email of the folder owner.
+    #
+    # Example
+    #
+    #   client.search_folder_for_envelopes(
+    #     folder_id: xxxxx-2222xxxxx,
+    #     query_params: {
+    #       search_text: "John Appleseed",
+    #       from_date: '7-1-2011+11:00:00+AM',
+    #       to_date: '7-1-2011+11:00:00+AM',
+    #       status: "completed"
+    #     }
+    #   )
+    #
+    def search_folder_for_envelopes(options={})
+      content_type = { 'Content-Type' => 'application/json' }
+      content_type.merge(options[:headers]) if options[:headers]
+
+      q ||= []
+      options[:query_params].each do |key, val|
+        q << "#{key}=#{val}"
+      end
+
+      uri = build_uri("/accounts/#{@acct_id}/folders/#{options[:folder_id]}/?#{q.join('&')}")
+
+      http = initialize_net_http_ssl(uri)
+      request = Net::HTTP::Get.new(uri.request_uri, headers(content_type))
+      response = http.request(request)
+      JSON.parse(response.body)
+    end
+
+
+    # TODO (2014-02-03) jonk => document
+    def create_account(options)
+      content_type = { 'Content-Type' => 'application/json' }
+      content_type.merge(options[:headers]) if options[:headers]
+
+      uri = build_uri('/accounts')
+
+      post_body = convert_hash_keys(options).to_json
+
+      http = initialize_net_http_ssl(uri)
+      request = Net::HTTP::Post.new(uri.request_uri, headers(content_type))
+      request.body = post_body
+      response = http.request(request)
+      JSON.parse(response.body)
+    end
+
+
+    # TODO (2014-02-03) jonk => document
+    def convert_hash_keys(value)
+      case value
+      when Array
+        value.map { |v| convert_hash_keys(v) }
+      when Hash
+        Hash[value.map { |k, v| [k.to_s.camelize(:lower), convert_hash_keys(v)] }]
+      else
+        value
+      end
+    end
+
+
+    # TODO (2014-02-03) jonk => document
+    def delete_account(account_id, options = {})
+      content_type = { 'Content-Type' => 'application/json' }
+      content_type.merge(options[:headers]) if options[:headers]
+
+      uri = build_uri("/accounts/#{account_id}")
+
+      http = initialize_net_http_ssl(uri)
+      request = Net::HTTP::Delete.new(uri.request_uri, headers(content_type))
+      response = http.request(request)
+      json = response.body
+      json = '{}' if json.nil? || json == ''
+      JSON.parse(json)
+    end
+
+
+    # Public: Retrieves a list of available templates
+    #
+    # Example
+    #
+    #    client.get_templates()
+    #
+    # Returns a list of the available templates.
+    def get_templates(options = {})
+      query_string = ''
+      if options[:folder].present?
+        query_string = "?folder=#{options[:folder]}"
+      end
+      
+      uri = build_uri("/accounts/#{acct_id}/templates/#{query_string}")
+
+      http = initialize_net_http_ssl(uri)
+      request = Net::HTTP::Get.new(uri.request_uri, headers({ 'Content-Type' => 'application/json' }))
+      JSON.parse(http.request(request).body)
+    end
+
+
+    # Public: Retrieves a list of templates used in an envelope
+    #
+    # Returns templateId, name and uri for each template found.
+    #
+    # envelope_id - DS id of envelope with templates.
+    def get_templates_in_envelope(envelope_id)
+      uri = build_uri("/accounts/#{acct_id}/envelopes/#{envelope_id}/templates")
+
+      http = initialize_net_http_ssl(uri)
+      request = Net::HTTP::Get.new(uri.request_uri, headers({ 'Content-Type' => 'application/json' }))
+      JSON.parse(http.request(request).body)
+    end
+
+
+    # Grabs envelope data.
+    # Equivalent to the following call in the API explorer:
+    # Get Envelopev2/accounts/:accountId/envelopes/:envelopeId
+    #
+    # envelope_id- DS id of envelope to be retrieved.
+    def get_envelope(envelope_id)
+      content_type = { 'Content-Type' => 'application/json' }
+      uri = build_uri("/accounts/#{acct_id}/envelopes/#{envelope_id}")
+
+      http = initialize_net_http_ssl(uri)
+      request = Net::HTTP::Get.new(uri.request_uri, headers(content_type))
+      response = http.request(request)
+      JSON.parse(response.body)
+    end
+
+
+    # Public deletes a recipient for a given envelope
+    #
+    # envelope_id  - ID of the envelope for which you want to retrieve the
+    #                signer info
+    # recipient_id - ID of the recipient to delete
+    #
+    # Returns a hash of recipients with an error code for any recipients that
+    # were not successfully deleted.
+    def delete_envelope_recipient(options={})
+      content_type = {'Content-Type' => 'application/json'}
+      content_type.merge(options[:headers]) if options[:headers]
+
+      uri = build_uri("/accounts/#{@acct_id}/envelopes/#{options[:envelope_id]}/recipients")
+      post_body = "{
+        \"signers\" : [{\"recipientId\" : \"#{options[:recipient_id]}\"}]
+       }"
+
+      http = initialize_net_http_ssl(uri)
+      request = Net::HTTP::Delete.new(uri.request_uri, headers(content_type))
+      request.body = post_body
+
+      response = http.request(request)
+      JSON.parse(response.body)
+    end
+
+
+    # Public voids an in-process envelope
+    #
+    # envelope_id      - ID of the envelope to be voided
+    # voided_reason    - Optional reason for the envelope being voided
+    #
+    # Returns the response (success or failure).
+    def void_envelope(options = {})
+      content_type = { 'Content-Type' => 'application/json' }
+      content_type.merge(options[:headers]) if options[:headers]
+
+      post_body = {
+          "status" =>"voided",
+          "voidedReason" => options[:voided_reason] || "No reason provided."
+      }.to_json
+
+      uri = build_uri("/accounts/#{acct_id}/envelopes/#{options[:folder_id]}")
+
+      http = initialize_net_http_ssl(uri)
+      request = Net::HTTP::Put.new(uri.request_uri, headers(content_type))
+      request.body = post_body
+      response = http.request(request)
+      response
+    end
+  end
 end

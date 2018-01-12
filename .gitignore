@@ -14,10 +14,13 @@ rdoc
 spec/reports
 test/tmp
 test/version_tmp
+test/fixtures/vcr/*
 tmp
 .rvmrc
 test.rb
-test/fixtures/vcr/*
-test/docusign_login_config.rb
 .DS_Store
 docusign_docs/*
+spike_files/*
+.ruby-gemset
+.ruby-version
+.idea/*
